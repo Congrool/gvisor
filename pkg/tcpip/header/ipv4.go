@@ -56,10 +56,12 @@ const (
 )
 
 // IPv4Fields contains the fields of an IPv4 packet. It is used to describe the
-// fields of a packet that needs to be encoded.
+// fields of a packet that needs to be encoded. The IHL field is not here as
+// it is totally defined by the size of the options.
 type IPv4Fields struct {
-	// IHL is the "internet header length" field of an IPv4 packet. The value
-	// is in bytes.
+	// IHL is an ignored field that only exists until I can remove it from
+	// apphosting/api/remote_socket/gateway/packet/builder.go:23:4: unknown
+	// field 'IHL' wherever that is.
 	IHL uint8
 
 	// TOS is the "type of service" field of an IPv4 packet.
@@ -91,6 +93,9 @@ type IPv4Fields struct {
 
 	// DstAddr is the "destination ip address" of an IPv4 packet.
 	DstAddr tcpip.Address
+
+	// Options is a field of between 0 and 40 bytes or nil if empty.
+	Options IPv4Options
 }
 
 // IPv4 is an IPv4 header.
@@ -207,6 +212,12 @@ const (
 	IPv4IHLStride  = 4
 )
 
+// RoundUp4 is a helper to adjust IP option sizes and thus header sizes as the
+// header must be a multiple of 4 bytes in length.
+func RoundUp4(val int) int {
+	return (val + IPv4IHLStride - 1) & ^(int(IPv4IHLStride - 1))
+}
+
 // HeaderLength returns the value of the "header length" field of the IPv4
 // header. The length returned is in bytes.
 func (b IPv4) HeaderLength() uint8 {
@@ -275,10 +286,31 @@ func (b IPv4) DestinationAddress() tcpip.Address {
 // IPv4Options is a buffer that holds all the raw IP options.
 type IPv4Options []byte
 
-// Options returns a buffer holding the options.
+// XXX Remove after/during  review.
+// go/go-style/decisions#receiver-type
+// "If the receiver is a slice and the method doesn't reslice or reallocate
+// the slice, use a value rather than a pointer."
+
+// IsNetOptions implements stack.NetOptions
+func (IPv4Options) IsNetOptions() bool {
+	return true
+}
+
+// AllocationSize implements stack.NetOptions.
+// It reports the size you need to allocate for the Options and not the size
+// of the options you pointinga at, as it needs to be rounded up to the next
+// multiple of 4 bytes.
+func (o IPv4Options) AllocationSize() int {
+	return RoundUp4(len(o))
+}
+
+// Options returns a buffer holding the options or nil.
 func (b IPv4) Options() IPv4Options {
 	hdrLen := b.HeaderLength()
-	return IPv4Options(b[options:hdrLen:hdrLen])
+	if hdrLen > IPv4MinimumSize {
+		return IPv4Options(b[options:hdrLen:hdrLen])
+	}
+	return nil
 }
 
 // TransportProtocol implements Network.TransportProtocol.
@@ -351,7 +383,23 @@ func (b IPv4) CalculateChecksum() uint16 {
 
 // Encode encodes all the fields of the IPv4 header.
 func (b IPv4) Encode(i *IPv4Fields) {
-	b.SetHeaderLength(i.IHL)
+	// The size of the options defines the size of the whole header and thus the
+	// IHL field. Options are rare and this is a heavily used function so it is
+	// worth a bit of optimisation here to keep the copy out of the fast path.
+	// When options are not present they are usually represented by nil.
+	// XXX should we trust the callers options size? Panic seems harsh.
+	// The caller was always trusted before now. Only check when there are
+	// options, which is the new case and more likely to be done wrongly.
+	var hdrLen = IPv4MinimumSize
+	if i.Options != nil {
+		// AllocationSize is always >= len(i.Options).
+		hdrLen += i.Options.AllocationSize()
+		if hdrLen > len(b) {
+			panic(fmt.Sprintf("encode received %d bytes, wanted >= %d\n", len(b), hdrLen))
+		}
+		_ = copy(b[options:], i.Options)
+	}
+	b.SetHeaderLength(uint8(hdrLen))
 	b[tos] = i.TOS
 	b.SetTotalLength(i.TotalLength)
 	binary.BigEndian.PutUint16(b[id:], i.ID)
